@@ -7,7 +7,13 @@ def default_config():
             'height': 400,  # 默认图像高度
             'width': 600,  # 默认图像宽度
             'patch_size': 2,
-            'win_size': 4
+            'win_size': 4,
+            # 新增窗口重叠相关配置
+            'window_overlap': True,  # 是否启用窗口重叠
+            'overlap_ratio': 0.5,  # 重叠比例（0.5表示50%重叠）
+            'blend_mode': 'gaussian',  # 混合模式：'linear' 或 'gaussian'
+            'train_random_shift': True,  # 训练时是否随机偏移窗口
+            'max_shift': 2  # 最大偏移量（patch数）
         },
         'loss_weights':{
             'reconstruction_weight': 1.0,

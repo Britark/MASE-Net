@@ -11,6 +11,7 @@ import argparse
 # 导入自定义模块
 from data_loader import get_data_loaders
 from models import Model
+from config import default_config
 
 
 def test_model(args):
@@ -35,8 +36,18 @@ def test_model(args):
         num_workers=args.num_workers
     )
 
+    # 创建配置并启用窗口重叠（如果指定）
+    config = default_config()
+    if args.use_window_overlap:
+        print("启用窗口重叠推理")
+        config['image_size']['window_overlap'] = True
+        config['image_size']['overlap_ratio'] = args.overlap_ratio
+        config['image_size']['blend_mode'] = args.blend_mode
+        # 推理时不需要随机偏移
+        config['image_size']['train_random_shift'] = False
+
     # 初始化模型
-    model = Model().to(device)
+    model = Model(config).to(device)
 
     # 加载模型权重
     print(f"正在从 {args.weights_path} 加载模型权重")
@@ -56,6 +67,10 @@ def test_model(args):
 
     # 用于后续可视化的图像计数
     image_count = 0
+
+    # 用于统计棋盘格伪影的减少情况
+    smoothness_original = []
+    smoothness_enhanced = []
 
     with torch.no_grad():
         for batch_idx, batch_data in progress_bar:
@@ -82,6 +97,20 @@ def test_model(args):
                 normal_light_img = targets[i].cpu().permute(1, 2, 0).numpy()
                 normal_light_img = np.clip(normal_light_img, 0, 1)
 
+                # 计算平滑度指标（用于评估棋盘格伪影）
+                if args.compute_smoothness:
+                    # 计算原始图像的边缘强度
+                    orig_diff_h = np.abs(low_light_img[1:, :, :] - low_light_img[:-1, :, :]).mean()
+                    orig_diff_w = np.abs(low_light_img[:, 1:, :] - low_light_img[:, :-1, :]).mean()
+                    orig_smoothness = (orig_diff_h + orig_diff_w) / 2
+                    smoothness_original.append(orig_smoothness)
+
+                    # 计算增强图像的边缘强度
+                    enh_diff_h = np.abs(enhanced_img[1:, :, :] - enhanced_img[:-1, :, :]).mean()
+                    enh_diff_w = np.abs(enhanced_img[:, 1:, :] - enhanced_img[:, :-1, :]).mean()
+                    enh_smoothness = (enh_diff_h + enh_diff_w) / 2
+                    smoothness_enhanced.append(enh_smoothness)
+
                 # 创建对比图 (原始低光照图像和增强后图像的对比)
                 plt.figure(figsize=(10, 5))
 
@@ -92,7 +121,7 @@ def test_model(args):
 
                 plt.subplot(1, 2, 2)
                 plt.imshow(enhanced_img)
-                plt.title('增强后图像')
+                plt.title(f'增强后图像{"(重叠窗口)" if args.use_window_overlap else "(非重叠窗口)"}')
                 plt.axis('off')
 
                 plt.tight_layout()
@@ -111,7 +140,7 @@ def test_model(args):
 
                     plt.subplot(1, 3, 2)
                     plt.imshow(enhanced_img)
-                    plt.title('增强后图像')
+                    plt.title(f'增强后图像{"(重叠窗口)" if args.use_window_overlap else "(非重叠窗口)"}')
                     plt.axis('off')
 
                     plt.subplot(1, 3, 3)
@@ -140,6 +169,17 @@ def test_model(args):
 
     print(f"验证集1测试完成。共生成 {image_count} 张对比图，保存在 {args.output_dir}")
 
+    # 打印平滑度统计信息
+    if args.compute_smoothness and smoothness_original:
+        avg_orig_smooth = np.mean(smoothness_original)
+        avg_enh_smooth = np.mean(smoothness_enhanced)
+        improvement = (avg_orig_smooth - avg_enh_smooth) / avg_orig_smooth * 100
+
+        print(f"\n平滑度分析:")
+        print(f"原始图像平均边缘强度: {avg_orig_smooth:.6f}")
+        print(f"增强图像平均边缘强度: {avg_enh_smooth:.6f}")
+        print(f"边缘强度降低: {improvement:.2f}% (正值表示更平滑)")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="在验证集1上测试低光照图像增强模型")
@@ -161,6 +201,17 @@ if __name__ == "__main__":
                         help='是否保存原始低光照图像')
     parser.add_argument('--save_enhanced', action='store_true',
                         help='是否单独保存增强后图像')
+
+    # 窗口重叠相关参数
+    parser.add_argument('--use_window_overlap', action='store_true',
+                        help='是否使用窗口重叠推理')
+    parser.add_argument('--overlap_ratio', type=float, default=0.5,
+                        help='窗口重叠比例（0-1之间）')
+    parser.add_argument('--blend_mode', type=str, default='gaussian',
+                        choices=['gaussian', 'linear'],
+                        help='重叠区域的混合模式')
+    parser.add_argument('--compute_smoothness', action='store_true',
+                        help='是否计算平滑度指标来评估棋盘格伪影')
 
     args = parser.parse_args()
     test_model(args)

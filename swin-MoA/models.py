@@ -11,6 +11,7 @@ from config import default_config
 import emb_gen
 from MoA import MultiheadAttention, MoE
 from utils import *
+from utils_overlap import WindowOverlapProcessor, merge_overlapping_params
 from decoder import *
 from ISP import *
 from losses import *
@@ -35,6 +36,17 @@ class Model(nn.Module):
         self.patch_size = config['image_size']['patch_size']
         self.win_size = config['image_size']['win_size']
 
+        # 读取窗口重叠相关配置
+        self.window_overlap = config['image_size'].get('window_overlap', False)
+        self.overlap_ratio = config['image_size'].get('overlap_ratio', 0.5)
+        self.blend_mode = config['image_size'].get('blend_mode', 'gaussian')
+        self.train_random_shift = config['image_size'].get('train_random_shift', True)
+        self.max_shift = config['image_size'].get('max_shift', 2)
+
+        # 创建窗口重叠处理器
+        if self.window_overlap:
+            self.window_processor = WindowOverlapProcessor(self.win_size, self.blend_mode)
+
         # 添加损失权重超参数
         loss_weights_config = config.get('loss_weights', {})
         self.reconstruction_weight = loss_weights_config.get('reconstruction_weight', 1.0)  # 重建损失权重
@@ -45,7 +57,7 @@ class Model(nn.Module):
 
         # 实例化特征提取器
         self.feature_extractor = FeatureExtractor(
-            patch_size=fe_config.get('patch_size', 2),#patch_size=4 win_size=5&& patch_size=8 win_size=7
+            patch_size=fe_config.get('patch_size', 2),
             in_channels=fe_config.get('in_channels', 3),
             embed_dim=fe_config.get('embed_dim', 128),
             win_size=fe_config.get('win_size', 5)
@@ -119,12 +131,12 @@ class Model(nn.Module):
         self.moe_1 = MoE(
             input_size=moe_1_config.get('input_size', 128),
             head_size=moe_1_config.get('head_size', 512),
-            num_experts=moe_1_config.get('num_experts', 8),#16
-            k=moe_1_config.get('k', 4),#8
+            num_experts=moe_1_config.get('num_experts', 8),
+            k=moe_1_config.get('k', 4),
             need_merge=moe_1_config.get('need_merge', False),
-            cvloss=moe_1_config.get('cvloss', 0.05),#0.01
-            aux_loss=moe_1_config.get('aux_loss', 1),#10
-            zloss=moe_1_config.get('zloss', 0.001),#0.005
+            cvloss=moe_1_config.get('cvloss', 0.05),
+            aux_loss=moe_1_config.get('aux_loss', 1),
+            zloss=moe_1_config.get('zloss', 0.001),
             bias=moe_1_config.get('bias', False),
             activation=nn.GELU(),
             noisy_gating=moe_1_config.get('noisy_gating', True)
@@ -306,11 +318,10 @@ class Model(nn.Module):
         Args:
             x: 输入的低光照图像
             target: 目标正常光照图像。训练模式下必须提供，否则无法计算损失
-            compute_loss: 是否计算损失。如果为None，则根据self.training判断
 
         Returns:
-            如果compute_loss为True: (enhanced_image, loss) - 增强后的图像和计算的损失
-            如果compute_loss为False: enhanced_image - 仅返回增强后的图像
+            如果训练模式: (enhanced_image, loss, reconstruction_loss) - 增强后的图像和计算的损失
+            如果测试模式: enhanced_image - 仅返回增强后的图像
         """
         # 使用混合精度计算
         with amp.autocast(enabled=torch.cuda.is_available()):
@@ -323,20 +334,56 @@ class Model(nn.Module):
             # 确保输入张量连续
             x = x.contiguous()
 
+            # 判断是否使用重叠窗口
+            use_overlap = self.window_overlap and not self.training  # 训练时不使用重叠
+
+            # 训练时的随机偏移
+            if self.training and self.train_random_shift and self.window_processor is not None:
+                # 对输入图像应用随机偏移
+                x_shifted = self.window_processor.apply_random_shift(x, self.max_shift)
+            else:
+                x_shifted = x
+
             # 特征提取
-            features, h_windows, w_windows = self.feature_extractor(x)
+            if use_overlap:
+                # 计算重叠步长
+                overlap_stride = int(self.win_size * (1 - self.overlap_ratio))
+                features, h_windows, w_windows, window_coords = self.feature_extractor(
+                    x_shifted, overlap_stride=overlap_stride, return_coords=True
+                )
+            else:
+                features, h_windows, w_windows = self.feature_extractor(x_shifted)
+                window_coords = None
 
             window_size = self.patch_size * self.win_size  # 计算窗口大小
 
-            # 重塑输入图像为[batch_size, channels, h_windows, window_size, w_windows, window_size]格式
-            # 使用reshape而不是view以保证内存连续性
-            x_reshaped = x.reshape(batch_size, channels, h_windows, window_size, w_windows, window_size)
+            # 如果使用重叠窗口，需要处理输入图像的窗口化
+            if use_overlap:
+                # 计算原始patch数
+                _, _, h_patches, w_patches = self.feature_extractor.patch_embed(
+                    self.feature_extractor.enhance(
+                        self.feature_extractor.local_feature(x_shifted)
+                    )
+                ).shape
 
-            # 调整维度顺序为[batch_size, h_windows, w_windows, window_size, window_size, channels]
-            x_reordered = x_reshaped.permute(0, 2, 4, 3, 5, 1).contiguous()
+                # 使用unfold创建重叠窗口
+                x_padded = x_shifted
+                x_unfold = x_padded.unfold(2, window_size, overlap_stride * self.patch_size)
+                x_unfold = x_unfold.unfold(3, window_size, overlap_stride * self.patch_size)
 
-            # 重塑为[batch_size, h_windows * w_windows, window_size, window_size, channels]
-            x_win = x_reordered.reshape(batch_size, h_windows * w_windows, window_size, window_size, channels)
+                # 重新排列为窗口格式
+                x_win = x_unfold.permute(0, 2, 3, 1, 4, 5).contiguous()
+                x_win = x_win.reshape(batch_size * h_windows * w_windows, channels, window_size, window_size)
+                x_win = x_win.permute(0, 2, 3, 1).contiguous()
+                x_win = x_win.reshape(batch_size, h_windows * w_windows, window_size, window_size, channels)
+            else:
+                # 原始的非重叠窗口处理
+                # 重塑输入图像为[batch_size, channels, h_windows, window_size, w_windows, window_size]格式
+                x_reshaped = x_shifted.reshape(batch_size, channels, h_windows, window_size, w_windows, window_size)
+                # 调整维度顺序为[batch_size, h_windows, w_windows, window_size, window_size, channels]
+                x_reordered = x_reshaped.permute(0, 2, 4, 3, 5, 1).contiguous()
+                # 重塑为[batch_size, h_windows * w_windows, window_size, window_size, channels]
+                x_win = x_reordered.reshape(batch_size, h_windows * w_windows, window_size, window_size, channels)
 
             # EispGeneratorFFN处理
             e_isp = self.emb_gen(features)
@@ -460,6 +507,7 @@ class Model(nn.Module):
             isp_final_2 = self.isp_2(isp_expert_2)
             isp_final_3 = self.isp_3(isp_expert_3)
             isp_final_4 = self.isp_4(isp_expert_4)
+            isp_final_5 = self.isp_final(isp_expert_4)
 
             # 获取配置中的param_dim参数
             param_dim_1 = self.isp_1.param_dim  # 通过解码器输出层获取param_dim
@@ -471,38 +519,85 @@ class Model(nn.Module):
             isp_final_2 = isp_final_2.reshape(-1, h_windows * w_windows, param_dim_2)
             isp_final_3 = isp_final_3.reshape(-1, h_windows * w_windows, 3, 3)
             isp_final_4 = isp_final_4.reshape(-1, h_windows * w_windows, param_dim_4)
-
-            enhanced_image = x_win
-
-            # 按顺序应用四个增强方法
-            # 4. 去噪与锐化
-            enhanced_image_1 = self.denoising_sharpening(images=enhanced_image, params=isp_final_4)
-
-            # 1. LIME增强
-            enhanced_image_2 = patch_gamma_correct(L=enhanced_image_1, gamma_increment=isp_final_1)
-
-            # 2. 白平衡
-            enhanced_image_3 = white_balance(predicted_gains=isp_final_2, I_source=enhanced_image_2)
-
-            # 3. 色彩校正矩阵
-            enhanced_image_4 = apply_color_correction_matrices(I_source=enhanced_image_3, pred_matrices=isp_final_3)
-
-            # 使用新的解码器生成最终去噪参数
-            isp_final_5 = self.isp_final(isp_expert_4)
             isp_final_5 = isp_final_5.reshape(-1, h_windows * w_windows, param_dim_4)
 
-            # 应用最终去噪和锐化
-            enhanced_image_final = self.denoising_sharpening(images=enhanced_image_4, params=isp_final_5)
+            # 如果使用重叠窗口，需要合并ISP参数
+            if use_overlap:
+                # 计算原始的patch数
+                h_patches_total = height // (self.patch_size * self.patch_size)
+                w_patches_total = width // (self.patch_size * self.patch_size)
 
-            # 将增强后的窗口图像重构回原始图像形状
-            enhanced_image_final = enhanced_image_final.permute(0, 1, 4, 2, 3).contiguous()  # [B, P, C, H, W]
-            enhanced_image_final = enhanced_image_final.reshape(
-                batch_size, h_windows, w_windows, channels, window_size, window_size
-            )
-            enhanced_image_final = enhanced_image_final.permute(0, 3, 1, 4, 2,
-                                                                5).contiguous()  # [B, C, h_win, win_size, w_win, win_size]
-            enhanced_image_final = enhanced_image_final.reshape(batch_size, channels,
-                                                                h_windows * window_size, w_windows * window_size)
+                # 合并重叠的ISP参数
+                isp_params_list = [isp_final_1, isp_final_2, isp_final_3, isp_final_4, isp_final_5]
+                merged_params = merge_overlapping_params(
+                    isp_params_list, window_coords, h_windows, w_windows,
+                    self.win_size, overlap_stride, h_patches_total, w_patches_total,
+                    self.blend_mode
+                )
+
+                isp_final_1, isp_final_2, isp_final_3, isp_final_4, isp_final_5 = merged_params
+
+                # 重新整形为窗口格式用于ISP处理
+                # 这里需要将合并后的参数重新分配到原始的非重叠窗口
+                # 为了简化，我们直接在像素级别应用ISP
+                enhanced_image = x_shifted  # 使用原始图像作为基础
+
+                # 将参数重塑为适合整个图像的格式
+                isp_1_full = isp_final_1.reshape(batch_size, h_patches_total, w_patches_total, param_dim_1)
+                isp_2_full = isp_final_2.reshape(batch_size, h_patches_total, w_patches_total, param_dim_2)
+                isp_3_full = isp_final_3.reshape(batch_size, h_patches_total, w_patches_total, 3, 3)
+                isp_4_full = isp_final_4.reshape(batch_size, h_patches_total, w_patches_total, param_dim_4)
+                isp_5_full = isp_final_5.reshape(batch_size, h_patches_total, w_patches_total, param_dim_4)
+
+                # 为每个patch应用ISP（这里需要修改ISP函数以支持逐patch处理）
+                # 临时解决方案：将整个图像作为一个大窗口处理
+                enhanced_image = enhanced_image.permute(0, 2, 3, 1).unsqueeze(1)  # [B, 1, H, W, C]
+
+                # 使用平均参数
+                isp_1_avg = isp_1_full.mean(dim=[1, 2], keepdim=True)
+                isp_2_avg = isp_2_full.mean(dim=[1, 2], keepdim=True)
+                isp_3_avg = isp_3_full.mean(dim=[1, 2], keepdim=True)
+                isp_4_avg = isp_4_full.mean(dim=[1, 2], keepdim=True)
+                isp_5_avg = isp_5_full.mean(dim=[1, 2], keepdim=True)
+
+                # 应用ISP增强
+                enhanced_image_1 = self.denoising_sharpening(images=enhanced_image, params=isp_4_avg)
+                enhanced_image_2 = patch_gamma_correct(L=enhanced_image_1, gamma_increment=isp_1_avg)
+                enhanced_image_3 = white_balance(predicted_gains=isp_2_avg, I_source=enhanced_image_2)
+                enhanced_image_4 = apply_color_correction_matrices(I_source=enhanced_image_3, pred_matrices=isp_3_avg)
+                enhanced_image_final = self.denoising_sharpening(images=enhanced_image_4, params=isp_5_avg)
+
+                # 恢复为标准图像格式
+                enhanced_image_final = enhanced_image_final.squeeze(1).permute(0, 3, 1, 2).contiguous()
+
+            else:
+                # 原始的非重叠处理
+                enhanced_image = x_win
+
+                # 按顺序应用四个增强方法
+                # 4. 去噪与锐化
+                enhanced_image_1 = self.denoising_sharpening(images=enhanced_image, params=isp_final_4)
+
+                # 1. LIME增强
+                enhanced_image_2 = patch_gamma_correct(L=enhanced_image_1, gamma_increment=isp_final_1)
+
+                # 2. 白平衡
+                enhanced_image_3 = white_balance(predicted_gains=isp_final_2, I_source=enhanced_image_2)
+
+                # 3. 色彩校正矩阵
+                enhanced_image_4 = apply_color_correction_matrices(I_source=enhanced_image_3, pred_matrices=isp_final_3)
+
+                # 应用最终去噪和锐化
+                enhanced_image_final = self.denoising_sharpening(images=enhanced_image_4, params=isp_final_5)
+
+                # 将增强后的窗口图像重构回原始图像形状
+                enhanced_image_final = enhanced_image_final.permute(0, 1, 4, 2, 3).contiguous()  # [B, P, C, H, W]
+                enhanced_image_final = enhanced_image_final.reshape(
+                    batch_size, h_windows, w_windows, channels, window_size, window_size
+                )
+                enhanced_image_final = enhanced_image_final.permute(0, 3, 1, 4, 2, 5).contiguous()
+                enhanced_image_final = enhanced_image_final.reshape(batch_size, channels,
+                                                                    h_windows * window_size, w_windows * window_size)
 
             # 训练模式下才计算损失并返回
             if self.training:

@@ -446,7 +446,7 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--compile', action='store_true', help='使用torch.compile优化模型(需要PyTorch 2.0+)')
     # 添加Warmup和余弦退火相关参数
-    parser.add_argument('--warmup_epochs', type=int, default=5, help='Warmup的轮数')
+    parser.add_argument('--warmup_epochs', type=int, default=0, help='Warmup的轮数')
     parser.add_argument('--min_lr_factor', type=float, default=0.01, help='余弦退火最小学习率是初始学习率的多少倍')
 
     args = parser.parse_args()
