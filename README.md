@@ -10,7 +10,7 @@ MaSE-Net是一个用于低光图像增强的深度学习网络，结合了混合
 
 - **双层耦合机制**: 创新的"指引-内容"双层耦合，实现选择与处理的深度整合
 - **分离式MoE**: 为不同ISP方法创建专用信息通道，避免信息混淆
-- **高效架构**: 仅6.58M参数即可达到PSNR=23.2, SSIM=0.86的优秀性能
+- **高效架构**: 仅3M参数即可达到最高PSNR=26, SSIM=0.86的优秀性能
 - **端到端训练**: 支持完整的训练和推理流程
 - **多数据集支持**: 支持LOL-v1、LOL-v2、LSRW等主流低光增强数据集
 
@@ -38,6 +38,7 @@ pip install -r requirements.txt
 pip install torch torchvision numpy matplotlib scikit-image tqdm pillow kornia optuna
 
 ### 数据集准备
+
 
 项目支持以下数据集结构：
 
