@@ -107,12 +107,12 @@ datasets/
 #### 基础训练
 ```bash
 # 在LOL-v2数据集上训练
-python train.py --data_dir ./datasets/LOL_v2 --epochs 1200 --batch_size 4
+python train.py --data_dir ./datasets/LOL_v2 --epochs 500 --batch_size 4
 
 # 自定义参数训练
 python train.py \
     --data_dir ./datasets/LOL_V1/lol_dataset \
-    --epochs 800 \
+    --epochs 500 \
     --batch_size 8 \
     --lr 7.11e-5 \
     --save_dir ./checkpoints
@@ -133,7 +133,7 @@ python train.py \
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `--data_dir` | 数据集路径 | `./datasets/LOL_v2` |
-| `--epochs` | 训练轮数 | 1200 |
+| `--epochs` | 训练轮数 | 500 |
 | `--batch_size` | 批大小 | 4 |
 | `--lr` | 学习率 | 7.11e-5 |
 | `--use_amp` | 混合精度训练 | False |
