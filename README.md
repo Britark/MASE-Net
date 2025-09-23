@@ -41,7 +41,7 @@ pip install torch torchvision numpy matplotlib scikit-image tqdm pillow kornia o
 
 ### 数据集准备
 
-数据集可从链接https://pan.baidu.com/s/1a9V1A6iIcr0IHUbL-9-a_A?pwd=vn7c获取
+数据集可从链接获取 https://pan.baidu.com/s/1a9V1A6iIcr0IHUbL-9-a_A?pwd=vn7c
 
 项目支持以下数据集结构：
 
