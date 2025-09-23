@@ -58,9 +58,9 @@ datasets/
 │   └── Val/
 └── OpenDataLab___LSRW/
     └── raw/LSRW/
-    ├── Train/
-    ├── Test/
-    └── Val/
+        ├── Train/
+        ├── Test/
+        └── Val/
 ```
 
 将数据集下载后放置在对应目录即可。
