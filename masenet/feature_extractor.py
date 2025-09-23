@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.cuda.amp as amp  # 导入混合精度训练支持
-import torch.nn.functional as F
+import math
 
 
 class FeatureExtractor(nn.Module):
@@ -31,13 +31,28 @@ class FeatureExtractor(nn.Module):
         # 窗口大小参数
         self.win_size = win_size
 
+        self._initialize_weights()
+
         # 使用CUDA融合优化器
         if torch.cuda.is_available():
             # 使这些模块使用CUDA优化的实现
             self.local_feature = torch.jit.script(self.local_feature)
             self.enhance = torch.jit.script(self.enhance)
 
-    def forward(self, x, overlap_stride=None, return_coords=False):
+    def _initialize_weights(self):
+        """LeCun Normal初始化"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                fan_in = m.in_channels * m.kernel_size[0] * m.kernel_size[1]
+                std = 1.0 / math.sqrt(fan_in)
+                nn.init.normal_(m.weight, 0, std)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.GroupNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
         # 使用混合精度计算以提高速度和内存效率
         with amp.autocast(enabled=torch.cuda.is_available()):
             # 局部特征提取 (保持空间尺寸)
@@ -50,17 +65,9 @@ class FeatureExtractor(nn.Module):
             x = self.enhance(x)  # [B, embed_dim, H/patch_size, W/patch_size]
 
             # 窗口分割
-            if overlap_stride is not None:
-                # 使用重叠窗口
-                windows, h_windows, w_windows, window_coords = self.window_partition_overlap(x, overlap_stride)
-                if return_coords:
-                    return windows, h_windows, w_windows, window_coords
-                else:
-                    return windows, h_windows, w_windows
-            else:
-                # 使用原始的非重叠窗口
-                windows, h_windows, w_windows = self.window_partition(x)
-                return windows, h_windows, w_windows
+            x = self.window_partition(x)  # [B, num_windows, win_size*win_size, embed_dim]
+
+        return x
 
     def window_partition(self, x):
         """
@@ -95,50 +102,3 @@ class FeatureExtractor(nn.Module):
         windows = x.view(B, num_windows, tokens, embed_dim)
 
         return windows, H // self.win_size, W // self.win_size  # 长宽都是多少个windows
-
-    def window_partition_overlap(self, x, stride):
-        """
-        使用滑动窗口将特征图分割成重叠的窗口
-        Args:
-            x: 输入特征图, 形状为 [B, C, H, W]
-            stride: 窗口滑动步长
-        Returns:
-            windows: 窗口特征, 形状为 [B, num_windows, win_size*win_size, C]
-            h_windows: 高度方向的窗口数
-            w_windows: 宽度方向的窗口数
-            window_coords: 每个窗口的坐标信息 [(h_start, w_start), ...]
-        """
-        B, C, H, W = x.shape
-        embed_dim = C
-
-        # 使用unfold实现滑动窗口
-        # unfold可以在指定维度上创建滑动窗口
-        # 先在H维度上展开
-        x_unfold = x.unfold(2, self.win_size, stride)  # [B, C, H_windows, W, win_size]
-        # 再在W维度上展开
-        x_unfold = x_unfold.unfold(3, self.win_size, stride)  # [B, C, H_windows, W_windows, win_size, win_size]
-
-        # 计算窗口数量
-        h_windows = x_unfold.shape[2]
-        w_windows = x_unfold.shape[3]
-        num_windows = h_windows * w_windows
-
-        # 重新排列维度
-        # [B, C, H_windows, W_windows, win_size, win_size] ->
-        # [B, H_windows, W_windows, win_size, win_size, C]
-        x_unfold = x_unfold.permute(0, 2, 3, 4, 5, 1).contiguous()
-
-        # 合并窗口维度
-        # [B, H_windows, W_windows, win_size, win_size, C] ->
-        # [B, num_windows, win_size*win_size, C]
-        windows = x_unfold.view(B, num_windows, self.win_size * self.win_size, embed_dim)
-
-        # 记录每个窗口的起始坐标（用于后续重建）
-        window_coords = []
-        for h in range(h_windows):
-            for w in range(w_windows):
-                h_start = h * stride
-                w_start = w * stride
-                window_coords.append((h_start, w_start))
-
-        return windows, h_windows, w_windows, window_coords

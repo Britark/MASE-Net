@@ -75,16 +75,14 @@ class LOLDataset(Dataset):
 
 
 def get_transform():
-    """
-    返回数据预处理变换
-    """
     return transforms.Compose([
-        transforms.Resize((400, 600)),  # 调整图像大小从400x600至396x600
-        transforms.ToTensor(),
+        transforms.Resize((400, 600)),
+        transforms.ToTensor(),  # 保持 [0,1] 范围
+        transforms.Lambda(lambda x: torch.clamp(x, 0.0, 1.0))  # 安全保护
     ])
 
 
-def get_data_loaders(root_dir, batch_size=32, eval_batch_size=None, num_workers=20):
+def get_data_loaders(root_dir, batch_size=16, eval_batch_size=None, num_workers=20):
     """
     获取训练、验证和测试数据加载器
 
@@ -95,7 +93,7 @@ def get_data_loaders(root_dir, batch_size=32, eval_batch_size=None, num_workers=
         num_workers: 数据加载的工作线程数
 
     Returns:
-        train_loader, val_loader_1, val_loader_2, test_loader
+        train_loader, val_loader, test_loader
     """
     # 如果没有指定评估批量大小，使用训练批量大小
     if eval_batch_size is None:
@@ -117,23 +115,10 @@ def get_data_loaders(root_dir, batch_size=32, eval_batch_size=None, num_workers=
         pin_memory=True
     )
 
-    # 将验证集分成两个子集
-    val_indices = list(range(len(val_dataset)))
-    val_subset_1 = Subset(val_dataset, val_indices[:32])
-    val_subset_2 = Subset(val_dataset, val_indices[32:])
-
-    # 为两个验证子集创建数据加载器
-    val_loader_1 = DataLoader(
-        val_subset_1,
-        batch_size=32,  # 固定为32
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-
-    val_loader_2 = DataLoader(
-        val_subset_2,
-        batch_size=21,  # 固定为21
+    # 创建验证数据加载器
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=eval_batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True
@@ -149,20 +134,20 @@ def get_data_loaders(root_dir, batch_size=32, eval_batch_size=None, num_workers=
 
     print(f"训练集大小: {len(train_dataset)}张图像对，{len(train_loader)}个批次")
 
-    return train_loader, val_loader_1, val_loader_2, test_loader
+    return train_loader, val_loader, test_loader
 
 
 # 用法示例
 if __name__ == "__main__":
     # 根目录
-    root_dir = "/root/autodl-tmp/swin-MOA/LOL-v2-Dataset/archive/LOL-v2/Real_captured"
+    root_dir = "./LOL_V1/lol_dataset"
     # 将相对路径转为绝对路径
     root_dir = os.path.expanduser(root_dir)
 
     # 获取数据加载器
-    train_loader, val_loader_1, val_loader_2, test_loader = get_data_loaders(
+    train_loader, val_loader, test_loader = get_data_loaders(
         root_dir=root_dir,
-        batch_size=32,
+        batch_size=16,
         num_workers=4
     )
 
@@ -175,20 +160,11 @@ if __name__ == "__main__":
         print(f"目标(正常光照)图像形状: {targets.shape}")
         break  # 只打印第一个批次
 
-    # 验证第一个验证加载器
-    for batch_data in val_loader_1:
+    # 验证验证数据加载器
+    for batch_data in val_loader:
         inputs = batch_data['input']
         targets = batch_data['target']
-        print(f"验证集第一部分:")
-        print(f"输入(低光照)图像形状: {inputs.shape}")
-        print(f"目标(正常光照)图像形状: {targets.shape}")
-        break
-
-    # 验证第二个验证加载器
-    for batch_data in val_loader_2:
-        inputs = batch_data['input']
-        targets = batch_data['target']
-        print(f"验证集第二部分:")
+        print(f"验证集:")
         print(f"输入(低光照)图像形状: {inputs.shape}")
         print(f"目标(正常光照)图像形状: {targets.shape}")
         break

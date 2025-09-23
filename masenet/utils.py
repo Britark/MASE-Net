@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.cuda.amp as amp  # 导入混合精度支持
+import math
 
 
 class PatchNeighborSearcher(nn.Module):
@@ -160,55 +161,178 @@ class ISPParameterGenerator(nn.Module):
             return expert_embeddings
 
 
-# 使用示例
-if __name__ == "__main__":
-    # 设置随机种子以保证结果可复现
-    torch.manual_seed(42)
+class RGB_HVI(nn.Module):
+    def __init__(self, density_k, alpha_S, alpha_I):
+        """
+        RGB ↔ HVI 变换模块
+        Args:
+            density_k: [batch, height, width, 1] 每个像素的density_k参数
+            alpha_S: [batch, height, width, 1] 局部对比度参数
+            alpha_I: [batch, height, width, 1] 局部亮度参数（全局）
+        """
+        super(RGB_HVI, self).__init__()
 
-    # 启用CUDA优化
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
+        # 将参数保存为模块属性
+        self.register_buffer('density_k', density_k)
+        self.register_buffer('alpha_S', alpha_S)
+        self.register_buffer('alpha_I', alpha_I)
 
-    # 创建测试数据
-    batches = 2
-    windows = 3
-    k = 2
-    embed_dim = 4
-    num_experts = 4
+    def HVIT(self, img):
+        """
+        RGB → HVI 变换
+        Args:
+            img: [batch, channel, height, width] RGB图像
+        Returns:
+            hvi: [batch, 3, height, width] HVI图像
+        """
+        eps = 1e-8
+        pi = 3.141592653589793
 
-    # 创建随机ISP嵌入
-    isp_per_win = torch.randn(batches, windows, k, embed_dim)
+        # 转换输入格式：[batch, channel, height, width] → [batch, height, width, channel]
+        img = img.permute(0, 2, 3, 1)  # [batch, height, width, 3]
 
-    # 创建专家索引，确保每个窗口选择的k个专家是不同的
-    expert_indices = torch.zeros(batches * windows, k, dtype=torch.long)
-    for win_idx in range(batches * windows):
-        # 从0到num_experts-1中随机选择k个不重复的专家索引
-        expert_indices[win_idx] = torch.randperm(num_experts)[:k]
+        # 1. 计算HSV中的基本分量
+        value = img.max(dim=3, keepdim=True)[0]  # I_max = max(R', G', B') [batch, height, width, 1]
+        img_min = img.min(dim=3, keepdim=True)[0]  # I_min = min(R', G', B') [batch, height, width, 1]
+        delta = value - img_min  # Δ = I_max - I_min
 
-    # 打印输入数据
-    print("=" * 50)
-    print("输入数据:")
-    print("-" * 50)
-    print(f"ISP嵌入形状: {isp_per_win.shape}")
-    print(isp_per_win)
+        # 2. 色相计算
+        hue = torch.zeros_like(value)  # [batch, height, width, 1]
 
-    print("\n" + "-" * 50)
-    print(f"专家索引形状: {expert_indices.shape}")
-    print("\n专家索引内容:")
-    print(expert_indices)
+        # 当 I_max = R' 且 Δ > ε 时：h = (G'-B')/Δ mod 6
+        mask_r = (img[..., 0:1] == value) & (delta > eps)
+        hue[mask_r] = ((img[..., 1:2] - img[..., 2:3]) / (delta + eps))[mask_r] % 6
 
-    print("\n" + "-" * 50)
-    print(f"总专家数: {num_experts}")
+        # 当 I_max = G' 且 Δ > ε 时：h = 2 + (B'-R')/Δ
+        mask_g = (img[..., 1:2] == value) & (delta > eps)
+        hue[mask_g] = (2.0 + (img[..., 2:3] - img[..., 0:1]) / (delta + eps))[mask_g]
 
-    # 创建ISP参数生成器
-    generator = ISPParameterGenerator()
+        # 当 I_max = B' 且 Δ > ε 时：h = 4 + (R'-G')/Δ
+        mask_b = (img[..., 2:3] == value) & (delta > eps)
+        hue[mask_b] = (4.0 + (img[..., 0:1] - img[..., 1:2]) / (delta + eps))[mask_b]
 
-    # 生成专家嵌入
-    expert_embeddings = generator(isp_per_win, expert_indices, num_experts)
+        # 当 Δ ≤ ε 时：h = 0 (已经初始化为0)
+        hue = hue / 6.0  # H = h/6 mod 1
 
-    # 打印输出数据
-    print("\n" + "=" * 50)
-    print("输出数据:")
-    print("-" * 50)
-    print(f"专家嵌入形状: {expert_embeddings.shape}")
-    print(expert_embeddings)
+        # 3. 饱和度计算：S = Δ/(I_max + ε)
+        saturation = delta / (value + eps)
+        saturation[value == 0] = 0
+
+        # 4. 强度坍缩函数：C_k = (sin(π·I_max/2) + ε)^(1/k_w)
+        # 注意：density_k = 1/k_w，所以公式变为 C_k = (sin(π·I_max/2) + ε)^density_k
+        color_sensitive = ((value * 0.5 * pi).sin() + eps).pow(self.density_k)
+
+        # 5. 极化变换：θ = 2π · H
+        # h_plane = cos(θ), v_plane = sin(θ)
+        ch = (2.0 * pi * hue).cos()  # h_plane
+        cv = (2.0 * pi * hue).sin()  # v_plane
+
+        # 6. HVI构建：
+        # Ĥ = C_k · S · h_plane
+        # V̂ = C_k · S · v_plane
+        # I = I_max
+        H = color_sensitive * saturation * ch
+        V = color_sensitive * saturation * cv
+        I = value
+
+        # 合并HVI通道
+        hvi = torch.cat([H, V, I], dim=3)  # [batch, height, width, 3]
+        hvi = hvi.permute(0, 3, 1, 2)# [batch, 3, height, width]
+        return hvi
+
+    def PHVIT(self, hvi):
+        """
+        HVI → RGB 逆变换
+        Args:
+            hvi: [batch, height, width, 3] HVI图像
+        Returns:
+            rgb: [batch, channel, height, width] RGB图像
+        """
+        eps = 1e-8
+        pi = 3.141592653589793
+
+        H, V, I = hvi[..., 0:1], hvi[..., 1:2], hvi[..., 2:3]  # 分离HVI通道
+
+        # 限制范围
+        H = torch.clamp(H, -1, 1)
+        V = torch.clamp(V, -1, 1)
+
+        # 1. 恢复极化分量
+        # V_recovered = α_I · I
+        v =  I  # 扩展alpha_I维度以匹配I
+        v = torch.clamp(v, 0, 1)  # 立即clamp！
+
+        # 重新计算C_k
+        color_sensitive = ((v * 0.5 * pi).sin() + eps).pow(self.density_k)
+
+        # h_norm = Ĥ/(C_k + ε), v_norm = V̂/(C_k + ε)
+        H_norm = H / (color_sensitive + eps)
+        V_norm = V / (color_sensitive + eps)
+        H_norm = torch.clamp(H_norm, -1, 1)
+        V_norm = torch.clamp(V_norm, -1, 1)
+
+        # 2. 恢复色相：H_recovered = arctan2(v_norm, h_norm)/(2π) mod 1
+        h = torch.atan2(V_norm + eps, H_norm + eps) / (2 * pi)
+        h = h % 1
+
+        # 🔍 关键调试：在α_S使用前后添加调试信息
+        s = torch.sqrt(H ** 2 + V ** 2 + eps)
+
+        s = s * self.alpha_S  # 简单的线性调整
+
+        # V_recovered = clamp(V_recovered, 0, 1)
+        v = torch.clamp(v, 0, 1)
+
+        # 4. HSV → RGB 标准变换
+        hi = torch.floor(h * 6.0)
+        f = h * 6.0 - hi
+        p = v * (1.0 - s)
+        q = v * (1.0 - (f * s))
+        t = v * (1.0 - ((1.0 - f) * s))
+
+        # 初始化RGB
+        r = torch.zeros_like(h)
+        g = torch.zeros_like(h)
+        b = torch.zeros_like(h)
+
+        # 根据hi值分配RGB (对应文档中的6种情况)
+        hi0 = (hi == 0)  # 当 i = 0：(R,G,B) = (V_recovered, t, p)
+        hi1 = (hi == 1)  # 当 i = 1：(R,G,B) = (q, V_recovered, p)
+        hi2 = (hi == 2)  # 当 i = 2：(R,G,B) = (p, V_recovered, t)
+        hi3 = (hi == 3)  # 当 i = 3：(R,G,B) = (p, q, V_recovered)
+        hi4 = (hi == 4)  # 当 i = 4：(R,G,B) = (t, p, V_recovered)
+        hi5 = (hi == 5)  # 当 i = 5：(R,G,B) = (V_recovered, p, q)
+
+        r[hi0] = v[hi0];
+        g[hi0] = t[hi0];
+        b[hi0] = p[hi0]
+
+        r[hi1] = q[hi1];
+        g[hi1] = v[hi1];
+        b[hi1] = p[hi1]
+
+        r[hi2] = p[hi2];
+        g[hi2] = v[hi2];
+        b[hi2] = t[hi2]
+
+        r[hi3] = p[hi3];
+        g[hi3] = q[hi3];
+        b[hi3] = v[hi3]
+
+        r[hi4] = t[hi4];
+        g[hi4] = p[hi4];
+        b[hi4] = v[hi4]
+
+        r[hi5] = v[hi5];
+        g[hi5] = p[hi5];
+        b[hi5] = q[hi5]
+
+        # 合并RGB通道
+        rgb = torch.cat([r, g, b], dim=3)  # [batch, height, width, 3]
+        rgb = rgb * self.alpha_I
+
+        # 转换输出格式：[batch, height, width, channel] → [batch, channel, height, width]
+        rgb = rgb.permute(0, 3, 1, 2)
+        rgb = torch.clamp(rgb, 0, 1)
+
+        return rgb

@@ -4,182 +4,9 @@ import torch.nn.functional as F
 import math
 from PIL import Image
 import torchvision.transforms as transforms
+import torchvision.models as models
 import os
-"""
-    limeloss方法没用到
-"""
-class LimeLoss(nn.Module):
-    """
-    光照图损失的模块化实现
-    """
-
-    def __init__(self, empty_threshold=1e-6):
-        """
-        参数:
-            empty_threshold: 判断patch是否为空的阈值
-        """
-        super(LimeLoss, self).__init__()
-        self.empty_threshold = empty_threshold
-        # 下面两个属性会在 set_data() 中被赋值
-        self.T_pred = None  # 形状 (bsz, patches, h, w)
-        self.Lc     = None  # 原始低光图，形状 (bsz, patches, h, w, 3)
-        self.valid_indices = None # (N, 2)
-
-    def set_data(self, T_pred, Lc):
-        """
-        设置当前损失所需的数据。
-        参数:
-            T_pred: 网络预测的光照图, 形状 (bsz, patches, h, w)
-            Lc:     对应的原始低光图 patch，对应形状 (bsz, patches, h, w, 3)
-        """
-        self.T_pred = T_pred
-        self.Lc      = Lc
-
-    def filter_valid_patches(self):
-        """
-        识别并过滤有效的 patch（平均值 > 阈值），并保存它们的索引。
-        返回:
-            valid_patches: shape (N, h, w)
-        """
-        bsz, num_patches, h, w = self.T_pred.shape
-
-        # 计算每个patch的平均像素值
-        patch_mean = self.T_pred.view(bsz, num_patches, -1).mean(dim=-1)  # (bsz, patches)
-
-        # 判断哪些 patch 有效
-        is_valid = patch_mean > self.empty_threshold  # (bsz, patches)
-
-        # 获取所有有效位置的索引
-        valid_indices = torch.nonzero(is_valid, as_tuple=False)  # (N, 2)
-        self.valid_indices = valid_indices  # 保存下来以便 fidelity_loss 使用
-
-        batch_idx = valid_indices[:, 0]
-        patch_idx = valid_indices[:, 1]
-        valid_patches = self.T_pred[batch_idx, patch_idx]  # (N, h, w)
-
-        return valid_patches
-
-    def fidelity_loss(self, valid_patches):
-        """
-        计算保真项: E = mean_{patch i} || T̂_i - T_{θ,i} ||_F^2
-        其中 T̂_i = max_c Lc_i[:,:,c]
-        参数:
-            valid_patches: shape (N, h, w)，等于 T_{θ,i}
-        返回:
-            scalar 张量，保真项损失（已经对所有 patch 平均）
-        """
-        # 预测光照
-        T_theta = valid_patches  # (N, h, w)
-
-        # 从原始 Lc 中提取相同索引的 patch
-        batch_idx, patch_idx = self.valid_indices[:,0], self.valid_indices[:,1]
-        Lc_patches = self.Lc[batch_idx, patch_idx]  # (N, h, w, 3)
-
-        # 计算 T_hat = max_c Lc
-        # Lc_patches[..., c] 对应三个通道
-        T_hat = Lc_patches.max(dim=-1).values  # (N, h, w)
-
-        # 逐 patch 计算 Frobenius 范数平方
-        # 先 element-wise 差，再平方，再对 h,w 求和，最后对 patch 求平均
-        per_patch_err = (T_hat - T_theta).pow(2).sum(dim=[1,2])  # (N,)
-
-        # 平均到所有有效 patch
-        loss = per_patch_err.mean()
-
-        return loss
-
-    def structure_loss(self, valid_patches, valid_idx, Lc):
-        """
-        计算结构平滑项（策略III）：
-        α ∑_x ∑_d W_d(x) [∇_d T_theta(x)]^2 / (|∇_d T_hat(x)| + eps)
-        """
-        # 超参数
-        alpha = 0.15
-        sigma = 2.0
-        eps = 1e-6
-
-        # 提取对应 Lc patch 并计算 T_hat
-        b_idx, p_idx = valid_idx.unbind(1)
-        Lc_patches = Lc[b_idx, p_idx]  # (N, h, w, 3)
-        T_hat = Lc_patches.max(dim=-1).values  # (N, h, w)
-        T_theta = valid_patches  # (N, h, w)
-
-        # 计算原始梯度 ∇_h 和 ∇_v (修正方向)
-        # 水平梯度 (x方向)
-        grad_h_hat = F.pad(T_hat[:, :, 1:] - T_hat[:, :, :-1], (0, 1, 0, 0), mode='constant', value=0)
-        # 垂直梯度 (y方向)
-        grad_v_hat = F.pad(T_hat[:, 1:, :] - T_hat[:, :-1, :], (0, 0, 0, 1), mode='constant', value=0)
-
-        # 计算预测的梯度
-        grad_h_theta = F.pad(T_theta[:, :, 1:] - T_theta[:, :, :-1], (0, 1, 0, 0), mode='constant', value=0)
-        grad_v_theta = F.pad(T_theta[:, 1:, :] - T_theta[:, :-1, :], (0, 0, 0, 1), mode='constant', value=0)
-
-        # 构造 Gaussian 核
-        k = int(math.ceil(3 * sigma)) * 2 + 1  # 确保核大小是奇数
-        r = k // 2
-        coords = torch.arange(k, device=T_theta.device, dtype=T_theta.dtype) - r
-        x = coords.view(1, -1).repeat(k, 1)
-        y = coords.view(-1, 1).repeat(1, k)
-        kernel = torch.exp(-(x ** 2 + y ** 2) / (2 * sigma ** 2))
-        kernel = kernel / kernel.sum()  # 归一化
-        kernel = kernel.view(1, 1, k, k)
-
-        # 计算分母：高斯加权梯度绝对值
-        abs_grad_h_hat = torch.abs(grad_h_hat).unsqueeze(1)  # (N, 1, h, w)
-        abs_grad_v_hat = torch.abs(grad_v_hat).unsqueeze(1)  # (N, 1, h, w)
-
-        # 使用卷积计算高斯加权和
-        denom_h = F.conv2d(abs_grad_h_hat, kernel, padding=r).squeeze(1)  # (N, h, w)
-        denom_v = F.conv2d(abs_grad_v_hat, kernel, padding=r).squeeze(1)  # (N, h, w)
-
-        # 计算权重 W_h 和 W_v
-        # 因为kernel已归一化，所以gauss_sum=1，但为了代码清晰度，显式计算
-        gauss_sum = kernel.sum()
-        W_h = gauss_sum / (denom_h + eps)
-        W_v = gauss_sum / (denom_v + eps)
-
-        # 计算最终正则化项 - 去掉多余的除法
-        term_h = W_h * grad_h_theta.pow(2)
-        term_v = W_v * grad_v_theta.pow(2)
-
-        # 计算全部正则化损失
-        reg = term_h + term_v
-
-        # 按 patch 平均后，乘以 α
-        loss = reg.sum(dim=[1, 2]).mean() * alpha
-
-        return loss
-
-    def forward(self, T_pred, Lc):
-        """
-        计算总损失：保真项 + 结构保持项
-
-        参数:
-            T_pred: 网络预测的光照图, 形状 (bsz, patches, h, w)
-            Lc: 对应的原始低光图 patch，对应形状 (bsz, patches, h, w, 3)
-
-        返回:
-            scalar 张量，总损失
-        """
-        # 设置数据
-        self.set_data(T_pred, Lc)
-
-        # 过滤有效patchesmain
-        valid_patches = self.filter_valid_patches()
-        if valid_patches.shape[0] == 0:
-            return torch.tensor(0.0, device=T_pred.device)
-
-        # 计算保真项
-        fidelity = self.fidelity_loss(valid_patches)
-
-        # 计算结构保持项
-        structure = self.structure_loss(valid_patches, self.valid_indices, self.Lc)
-
-        # 总损失
-        lime_loss = fidelity + structure
-
-        return lime_loss
-
+from pytorch_msssim import ssim
 
 class L1ReconstructionLoss(nn.Module):
     """
@@ -210,3 +37,267 @@ class L1ReconstructionLoss(nn.Module):
         - loss: L1 损失值
         """
         return self.loss_fn(enhanced_image, original_image)
+
+
+class PerceptualLoss(nn.Module):
+    """
+    基于VGG的感知损失
+    使用预训练VGG网络的多层特征计算感知差异
+    """
+
+    def __init__(self, vgg_model):
+        super(PerceptualLoss, self).__init__()
+        self.vgg_layers = vgg_model
+        self.layer_name_mapping = {
+            '3': "relu1_2",
+            '8': "relu2_2",
+            '15': "relu3_3"
+        }
+
+    def output_features(self, x):
+        output = {}
+        for name, module in self.vgg_layers._modules.items():
+            x = module(x)
+            if name in self.layer_name_mapping:
+                output[self.layer_name_mapping[name]] = x
+        return list(output.values())
+
+    def forward(self, pred_im, gt):
+        loss = []
+        pred_im_features = self.output_features(pred_im)
+        gt_features = self.output_features(gt)
+        for pred_im_feature, gt_feature in zip(pred_im_features, gt_features):
+            loss.append(F.mse_loss(pred_im_feature, gt_feature))
+
+        return sum(loss) / len(loss)
+
+class EdgeLoss(nn.Module):
+    """
+    曝光／边缘损失 L_e
+    计算预测与目标在梯度（边缘）空间的差异，用 L1 形式：
+      L_e = |∇X - ∇Y|_1
+    其中 ∇ 由 Sobel 卷积近似。
+    """
+    def __init__(self, reduction='mean'):
+        super().__init__()
+        self.reduction = reduction
+
+        # Sobel 卷积核
+        kx = torch.tensor([[1., 0., -1.],
+                           [2., 0., -2.],
+                           [1., 0., -1.]], dtype=torch.float32)
+        ky = kx.t()
+        # shape [1,1,3,3]
+        self.register_buffer('sobel_x', kx.view(1,1,3,3))
+        self.register_buffer('sobel_y', ky.view(1,1,3,3))
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred:   预测图 [B, C, H, W], 范围 [0,1]
+            target: 目标图 [B, C, H, W], 范围 [0,1]
+        Returns:
+            边缘差异 L1 损失
+        """
+        # 先把多通道合并为单通道灰度：L = 0.299R+0.587G+0.114B
+        def to_gray(x):
+            if x.shape[1] == 3:
+                w = torch.tensor([0.299,0.587,0.114], device=x.device).view(1,3,1,1)
+                return (x * w).sum(dim=1, keepdim=True)
+            return x
+
+        p = to_gray(pred)
+        t = to_gray(target)
+
+        # Sobel 梯度
+        gx_p = F.conv2d(p, self.sobel_x, padding=1)
+        gy_p = F.conv2d(p, self.sobel_y, padding=1)
+        gx_t = F.conv2d(t, self.sobel_x, padding=1)
+        gy_t = F.conv2d(t, self.sobel_y, padding=1)
+
+        # L1 差异
+        loss = F.l1_loss(gx_p, gx_t, reduction='none') + F.l1_loss(gy_p, gy_t, reduction='none')
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss  # 'none'
+
+
+class DetailLoss(nn.Module):
+    """
+    细节（structure）损失 L_d
+    基于 SSIM（结构相似性），loss = 1 - SSIM
+    需要安装 pytorch_msssim: pip install pytorch-msssim
+    """
+    def __init__(self, data_range=1.0, size_average=True):
+        super().__init__()
+        self.ssim = ssim
+        self.data_range = data_range
+        self.size_average = size_average
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred:   预测图 [B, C, H, W], 范围 [0,1]
+            target: 目标图 [B, C, H, W], 范围 [0,1]
+        Returns:
+            细节损失 = 1 - SSIM(pred, target)
+        """
+        # pytorch_msssim.ssim 返回相似度 [0,1]
+        sim = self.ssim(pred, target,
+                        data_range=self.data_range,
+                        size_average=self.size_average)
+        return 1.0 - sim
+
+
+class CharbonnierLoss(nn.Module):
+    """
+    Charbonnier损失函数
+    鲁棒的重建损失，对outlier不敏感，特别适合图像恢复任务
+    L_Charbonnier = √((pred - target)² + ε²)
+    """
+    def __init__(self, epsilon=1e-3, reduction='mean'):
+        super().__init__()
+        self.epsilon = epsilon
+        self.reduction = reduction
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred:   预测图像 [B, C, H, W], 范围 [0,1]
+            target: 目标图像 [B, C, H, W], 范围 [0,1]
+        Returns:
+            Charbonnier损失值
+        """
+        diff = pred - target
+        loss = torch.sqrt(diff * diff + self.epsilon * self.epsilon)
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
+class LABColorLoss(nn.Module):
+    """
+    LAB色彩空间损失
+    专门约束色彩保真度，防止颜色偏移
+    """
+    def __init__(self, reduction='mean', color_weight=1.0):
+        super().__init__()
+        self.reduction = reduction
+        self.color_weight = color_weight
+        
+    def rgb_to_lab(self, rgb):
+        """
+        RGB到LAB色彩空间转换
+        rgb: [B, 3, H, W], 范围[0,1]
+        """
+        # 转换为线性RGB
+        def srgb_to_linear(c):
+            return torch.where(c <= 0.04045, c / 12.92, torch.pow((c + 0.055) / 1.055, 2.4))
+        
+        linear_rgb = srgb_to_linear(rgb)
+        
+        # RGB to XYZ (使用D65白点) - 安全创建转换矩阵
+        try:
+            rgb_to_xyz = torch.tensor([
+                [0.4124564, 0.3575761, 0.1804375],
+                [0.2126729, 0.7151522, 0.0721750],
+                [0.0193339, 0.1191920, 0.9503041]
+            ], device=rgb.device, dtype=rgb.dtype, requires_grad=False)
+        except Exception:
+            # 如果张量创建失败，返回原始输入
+            return rgb
+        
+        # 安全的矩阵乘法
+        try:
+            B, C, H, W = linear_rgb.shape
+            if H * W == 0:  # 检查空间维度
+                return torch.zeros_like(rgb)
+                
+            linear_rgb_flat = linear_rgb.view(B, C, H * W)  # [B, 3, H*W]
+            
+            # 确保矩阵维度匹配
+            if rgb_to_xyz.shape != (3, 3) or linear_rgb_flat.shape[1] != 3:
+                return torch.zeros_like(rgb)
+                
+            xyz_flat = torch.bmm(rgb_to_xyz.unsqueeze(0).expand(B, -1, -1), linear_rgb_flat)
+            xyz = xyz_flat.view(B, 3, H, W)
+            
+            # 安全的归一化到D65白点
+            d65_norm = torch.tensor([0.95047, 1.0, 1.08883], device=rgb.device, dtype=rgb.dtype, requires_grad=False).view(1, 3, 1, 1)
+            xyz = xyz / d65_norm
+            
+        except Exception:
+            # 如果矩阵运算失败，返回零张量
+            return torch.zeros_like(rgb)
+        
+        # 安全的XYZ to LAB转换
+        try:
+            # 数值稳定性检查
+            xyz = torch.clamp(xyz, min=1e-8, max=10.0)
+            
+            def f(t):
+                # 标准CIE LAB转换函数，增加数值稳定性
+                t_safe = torch.clamp(t, min=1e-8)
+                return torch.where(t_safe > 0.008856, torch.pow(t_safe, 1/3), (7.787 * t_safe) + (16/116))
+            
+            # 安全的通道索引
+            if xyz.shape[1] < 3:
+                return torch.zeros_like(rgb)
+                
+            fx = f(xyz[:, 0:1])  # f(X/Xn)
+            fy = f(xyz[:, 1:2])  # f(Y/Yn)  
+            fz = f(xyz[:, 2:3])  # f(Z/Zn)
+            
+            L = 116 * fy - 16           # L* = 116*f(Y/Yn) - 16
+            a = 500 * (fx - fy)         # a* = 500*(f(X/Xn) - f(Y/Yn))
+            b = 200 * (fy - fz)         # b* = 200*(f(Y/Yn) - f(Z/Zn))
+            
+            # 确保LAB值在合理范围内
+            L = torch.clamp(L, 0, 100)
+            a = torch.clamp(a, -128, 128)
+            b = torch.clamp(b, -128, 128)
+            
+            result = torch.cat([L, a, b], dim=1)
+            
+            # 最终检查
+            if result.shape != rgb.shape:
+                return torch.zeros_like(rgb)
+                
+            return result
+            
+        except Exception:
+            # 如果LAB转换失败，返回零张量
+            return torch.zeros_like(rgb)
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred:   预测图 [B, C, H, W], 范围 [0,1]
+            target: 目标图 [B, C, H, W], 范围 [0,1]
+        Returns:
+            LAB色彩损失，主要约束a*b*通道
+        """
+        pred_lab = self.rgb_to_lab(pred)
+        target_lab = self.rgb_to_lab(target)
+        
+        # 分离L和ab通道
+        pred_a, pred_b = pred_lab[:, 1:2], pred_lab[:, 2:3]
+        target_a, target_b = target_lab[:, 1:2], target_lab[:, 2:3]
+        
+        # 主要约束ab通道(色彩信息)
+        color_loss = F.l1_loss(pred_a, target_a, reduction='none') + F.l1_loss(pred_b, target_b, reduction='none')
+        
+        if self.reduction == 'mean':
+            return self.color_weight * color_loss.mean()
+        elif self.reduction == 'sum':
+            return self.color_weight * color_loss.sum()
+        else:
+            return self.color_weight * color_loss
+

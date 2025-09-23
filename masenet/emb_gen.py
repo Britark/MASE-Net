@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.cuda.amp as amp  # 导入混合精度训练支持
+import math
 
 
 class EispGeneratorFFN(nn.Module):
@@ -53,15 +54,17 @@ class EispGeneratorFFN(nn.Module):
             self.ffn_path = torch.jit.script(self.ffn_path)
 
     def _initialize_weights(self):
-        """初始化网络权重"""
-        # 使用He初始化（适用于ReLU/GELU等激活函数）
-        nn.init.kaiming_normal_(self.fc1.weight, nonlinearity='relu')
-        nn.init.kaiming_normal_(self.fc2.weight, nonlinearity='relu')
-        nn.init.kaiming_normal_(self.fc_out.weight, nonlinearity='relu')
+        """改进的FFN初始化策略"""
+        # 针对GELU激活函数的优化初始化
+        for m in [self.fc1, self.fc2]:
+            # GELU的有效增益约为1.7（相比ReLU的sqrt(2)）
+            fan_in = m.in_features
+            std = math.sqrt(1.7 / fan_in)  # 为GELU调整
+            nn.init.normal_(m.weight, 0, std)
+            nn.init.zeros_(m.bias)
 
-        # 偏置初始化为0
-        nn.init.zeros_(self.fc1.bias)
-        nn.init.zeros_(self.fc2.bias)
+        # 输出层使用更小的初始化，避免梯度爆炸
+        nn.init.normal_(self.fc_out.weight, 0, 0.02)
         nn.init.zeros_(self.fc_out.bias)
 
     def forward(self, x):
@@ -150,13 +153,17 @@ class QKIspGenerator(nn.Module):
         self._initialize_weights()
 
     def _initialize_weights(self):
-        """初始化网络权重"""
-        # 初始化K投影矩阵
-        nn.init.xavier_uniform_(self.k_combined.weight)
+        """针对Attention的优化初始化"""
+        # 使用截断正态分布，标准差根据维度调整
+        # 这是Transformer中常用的初始化策略
+        std = math.sqrt(2.0 / (self.dim + self.dim))  # Xavier的变种
+
+        # K投影矩阵初始化
+        nn.init.trunc_normal_(self.k_combined.weight, std=std)
         nn.init.zeros_(self.k_combined.bias)
 
-        # 初始化Q投影矩阵
-        nn.init.xavier_uniform_(self.q_projection.weight)
+        # Q投影矩阵初始化 - 使用稍小的std以保持稳定性
+        nn.init.trunc_normal_(self.q_projection.weight, std=std * 0.8)
         nn.init.zeros_(self.q_projection.bias)
 
     def forward(self, E_isp):
@@ -214,6 +221,7 @@ class KVFeatureGenerator(nn.Module):
 
         # 优化：将K和V投影合并为一个大矩阵以提高并行性
         self.kv_projection = nn.Linear(embed_dim, embed_dim * 2)
+        self.embed_dim = embed_dim
 
         # Dropout层
         self.dropout = nn.Dropout(dropout_rate)
@@ -222,9 +230,13 @@ class KVFeatureGenerator(nn.Module):
         self._initialize_weights()
 
     def _initialize_weights(self):
-        """初始化网络权重"""
-        # 初始化投影矩阵
-        nn.init.xavier_uniform_(self.kv_projection.weight)
+        """针对K,V投影的优化初始化"""
+        # 对于K,V投影，使用专门的初始化策略
+        # 参考T5和GPT的初始化方式
+        std = math.sqrt(1.0 / self.embed_dim)
+
+        # 由于是K,V投影，使用相对保守的初始化
+        nn.init.normal_(self.kv_projection.weight, 0, std)
         nn.init.zeros_(self.kv_projection.bias)
 
     def forward(self, feature):

@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.cuda.amp as amp  # 添加混合精度支持
+import kornia.losses  # 添加kornia损失函数
 
 import feature_extractor
 from feature_extractor import FeatureExtractor
@@ -11,10 +12,10 @@ from config import default_config
 import emb_gen
 from MoA import MultiheadAttention, MoE
 from utils import *
-from utils_overlap import WindowOverlapProcessor, merge_overlapping_params
 from decoder import *
 from ISP import *
 from losses import *
+from torchvision.models import vgg16
 
 
 class Model(nn.Module):
@@ -36,28 +37,21 @@ class Model(nn.Module):
         self.patch_size = config['image_size']['patch_size']
         self.win_size = config['image_size']['win_size']
 
-        # 读取窗口重叠相关配置
-        self.window_overlap = config['image_size'].get('window_overlap', False)
-        self.overlap_ratio = config['image_size'].get('overlap_ratio', 0.5)
-        self.blend_mode = config['image_size'].get('blend_mode', 'gaussian')
-        self.train_random_shift = config['image_size'].get('train_random_shift', True)
-        self.max_shift = config['image_size'].get('max_shift', 2)
-
-        # 创建窗口重叠处理器
-        if self.window_overlap:
-            self.window_processor = WindowOverlapProcessor(self.win_size, self.blend_mode)
-
         # 添加损失权重超参数
         loss_weights_config = config.get('loss_weights', {})
         self.reconstruction_weight = loss_weights_config.get('reconstruction_weight', 1.0)  # 重建损失权重
         self.auxiliary_weight = loss_weights_config.get('auxiliary_weight', 0.1)  # 辅助损失权重
+        self.perceptual_weight = loss_weights_config.get('perceptual_weight', 0.1)
+        self.psnr_weight = loss_weights_config.get('psnr_weight', 0.28)  # PSNR损失权重 (降低)
+        self.ssim_weight = loss_weights_config.get('ssim_weight', 0.3)  # SSIM损失权重 (降低)
+        self.lab_color_weight = loss_weights_config.get('lab_color_weight', 0.02)  # LAB色彩损失权重
 
         # 获取特征提取器配置
         fe_config = config.get('feature_extractor', {})
 
         # 实例化特征提取器
         self.feature_extractor = FeatureExtractor(
-            patch_size=fe_config.get('patch_size', 2),
+            patch_size=fe_config.get('patch_size', 2),  # patch_size=4 win_size=5&& patch_size=8 win_size=7
             in_channels=fe_config.get('in_channels', 3),
             embed_dim=fe_config.get('embed_dim', 128),
             win_size=fe_config.get('win_size', 5)
@@ -65,6 +59,9 @@ class Model(nn.Module):
 
         # 获取EispGeneratorFFN配置
         emb_gen_config = config.get('emb_gen', {})
+
+        # 获取QKIspGenerator配置（提前获取以使用num_heads）
+        qk_gen_config = config.get('qk_gen', {})
 
         # 实例化EispGeneratorFFN
         self.emb_gen = emb_gen.EispGeneratorFFN(
@@ -74,19 +71,16 @@ class Model(nn.Module):
             dropout_rate=emb_gen_config.get('dropout_rate', 0.1)
         )
 
-        # 添加线性层，将e_isp的最后一个维度映射为其4倍大
+        # 添加线性层，将e_isp的最后一个维度映射为其num_heads倍大
         self.e_isp_expand = nn.Linear(
             emb_gen_config.get('output_dim', 128),
-            emb_gen_config.get('output_dim', 128) * 4
+            emb_gen_config.get('output_dim', 128) * qk_gen_config.get('num_heads', 3)
         )
-
-        # 获取QKIspGenerator配置
-        qk_gen_config = config.get('qk_gen', {})
 
         # 实例化QKIspGenerator
         self.qk_gen = emb_gen.QKIspGenerator(
             dim=qk_gen_config.get('dim', 128),
-            num_heads=qk_gen_config.get('num_heads', 4),
+            num_heads=qk_gen_config.get('num_heads', 3),
             dropout_rate=qk_gen_config.get('dropout_rate', 0.1)
         )
 
@@ -103,15 +97,17 @@ class Model(nn.Module):
         multi_attn_1_config = config.get('multi_attention_1', {})
 
         # 实例化MultiheadAttention
+        embed_dim_1 = multi_attn_1_config.get('embed_dim', 128)
+        num_heads_1 = multi_attn_1_config.get('num_heads', 2)
         self.multi_attention_1 = MultiheadAttention(
-            embed_dim=multi_attn_1_config.get('embed_dim', 128),
-            num_heads=multi_attn_1_config.get('num_heads', 2),
+            embed_dim=embed_dim_1,
+            num_heads=num_heads_1,
             dropout=multi_attn_1_config.get('dropout', 0.1),
             bias=multi_attn_1_config.get('bias', True),
             q_noise=multi_attn_1_config.get('q_noise', 0.005),
             qn_block_size=multi_attn_1_config.get('qn_block_size', 8),
             num_expert=multi_attn_1_config.get('num_expert', 4),
-            head_dim=multi_attn_1_config.get('head_dim', 64),
+            head_dim=embed_dim_1 // num_heads_1,  # 自动计算head_dim
             use_attention_gate=multi_attn_1_config.get('use_attention_gate', True),
             cvloss=multi_attn_1_config.get('cvloss', 0.05),
             aux_loss=multi_attn_1_config.get('aux_loss', 1),
@@ -130,16 +126,17 @@ class Model(nn.Module):
         # 创建MoE实例
         self.moe_1 = MoE(
             input_size=moe_1_config.get('input_size', 128),
-            head_size=moe_1_config.get('head_size', 512),
-            num_experts=moe_1_config.get('num_experts', 8),
-            k=moe_1_config.get('k', 4),
+            head_size=moe_1_config.get('head_size', 256),
+            hidden_sizes=moe_1_config.get('hidden_sizes', None),  # 支持多层FFN
+            num_experts=moe_1_config.get('num_experts', 3),
+            k=moe_1_config.get('k', 1),
             need_merge=moe_1_config.get('need_merge', False),
             cvloss=moe_1_config.get('cvloss', 0.05),
-            aux_loss=moe_1_config.get('aux_loss', 1),
+            aux_loss=moe_1_config.get('aux_loss', 0.01),
             zloss=moe_1_config.get('zloss', 0.001),
-            bias=moe_1_config.get('bias', False),
+            bias=moe_1_config.get('bias', True),
             activation=nn.GELU(),
-            noisy_gating=moe_1_config.get('noisy_gating', True)
+            noisy_gating=moe_1_config.get('noisy_gating', False)
         )
 
         # 专门为moe_output_1定义的归一化层
@@ -149,21 +146,23 @@ class Model(nn.Module):
         multi_attn_2_config = config.get('multi_attention_2', {})
 
         # 实例化MultiheadAttention2
+        embed_dim_2 = multi_attn_2_config.get('embed_dim', 128)
+        num_heads_2 = multi_attn_2_config.get('num_heads', 1)
         self.multi_attention_2 = MultiheadAttention(
-            embed_dim=multi_attn_2_config.get('embed_dim', 128),
-            num_heads=multi_attn_2_config.get('num_heads', 2),
+            embed_dim=embed_dim_2,
+            num_heads=num_heads_2,
             dropout=multi_attn_2_config.get('dropout', 0.1),
             bias=multi_attn_2_config.get('bias', True),
             q_noise=multi_attn_2_config.get('q_noise', 0.005),
             qn_block_size=multi_attn_2_config.get('qn_block_size', 8),
-            num_expert=multi_attn_2_config.get('num_expert', 4),
-            head_dim=multi_attn_2_config.get('head_dim', 64),
+            num_expert=multi_attn_2_config.get('num_expert', 3),
+            head_dim=embed_dim_2 // num_heads_2,  # 自动计算head_dim
             use_attention_gate=multi_attn_2_config.get('use_attention_gate', False),
             cvloss=multi_attn_2_config.get('cvloss', 0.05),
-            aux_loss=multi_attn_2_config.get('aux_loss', 1),
+            aux_loss=multi_attn_2_config.get('aux_loss', 0.01),
             zloss=multi_attn_2_config.get('zloss', 0.001),
-            sample_topk=multi_attn_2_config.get('sample_topk', 0),
-            noisy_gating=multi_attn_2_config.get('noisy_gating', True),
+            sample_topk=multi_attn_2_config.get('sample_topk', 1),
+            noisy_gating=multi_attn_2_config.get('noisy_gating', False),
             use_pos_bias=multi_attn_2_config.get('use_pos_bias', False)
         )
 
@@ -176,16 +175,17 @@ class Model(nn.Module):
         # 创建MoE实例
         self.moe_2 = MoE(
             input_size=moe_2_config.get('input_size', 128),
-            head_size=moe_2_config.get('head_size', 512),
-            num_experts=moe_2_config.get('num_experts', 8),
-            k=moe_2_config.get('k', 2),
+            head_size=moe_2_config.get('head_size', 256),
+            hidden_sizes=moe_2_config.get('hidden_sizes', None),  # 支持多层FFN
+            num_experts=moe_2_config.get('num_experts', 3),
+            k=moe_2_config.get('k', 1),
             need_merge=moe_2_config.get('need_merge', True),
             cvloss=moe_2_config.get('cvloss', 0.05),
-            aux_loss=moe_2_config.get('aux_loss', 1),
+            aux_loss=moe_2_config.get('aux_loss', 0.01),
             zloss=moe_2_config.get('zloss', 0.001),
-            bias=moe_2_config.get('bias', False),
+            bias=moe_2_config.get('bias', True),
             activation=nn.GELU(),
-            noisy_gating=moe_2_config.get('noisy_gating', True)
+            noisy_gating=moe_2_config.get('noisy_gating', False)
         )
 
         # 专门为moe_output_1定义的归一化层
@@ -197,21 +197,23 @@ class Model(nn.Module):
         multi_attn_3_config = config.get('multi_attention_3', {})
 
         # 实例化MultiheadAttention3
+        embed_dim_3 = multi_attn_3_config.get('embed_dim', 128)
+        num_heads_3 = multi_attn_3_config.get('num_heads', 1)
         self.multi_attention_3 = MultiheadAttention(
-            embed_dim=multi_attn_3_config.get('embed_dim', 128),
-            num_heads=multi_attn_3_config.get('num_heads', 2),
+            embed_dim=embed_dim_3,
+            num_heads=num_heads_3,
             dropout=multi_attn_3_config.get('dropout', 0.1),
             bias=multi_attn_3_config.get('bias', True),
-            q_noise=multi_attn_3_config.get('q_noise', 0.005),
+            q_noise=multi_attn_3_config.get('q_noise', 0.05),
             qn_block_size=multi_attn_3_config.get('qn_block_size', 8),
-            num_expert=multi_attn_3_config.get('num_expert', 8),
-            head_dim=multi_attn_3_config.get('head_dim', 64),
+            num_expert=multi_attn_3_config.get('num_expert', 3),
+            head_dim=embed_dim_3 // num_heads_3,  # 自动计算head_dim
             use_attention_gate=multi_attn_3_config.get('use_attention_gate', False),
             cvloss=multi_attn_3_config.get('cvloss', 0.05),
-            aux_loss=multi_attn_3_config.get('aux_loss', 1),
+            aux_loss=multi_attn_3_config.get('aux_loss', 0.01),
             zloss=multi_attn_3_config.get('zloss', 0.001),
-            sample_topk=multi_attn_3_config.get('sample_topk', 0),
-            noisy_gating=multi_attn_3_config.get('noisy_gating', True),
+            sample_topk=multi_attn_3_config.get('sample_topk', 1),
+            noisy_gating=multi_attn_3_config.get('noisy_gating', False),
             use_pos_bias=multi_attn_3_config.get('use_pos_bias', True)
         )
 
@@ -224,16 +226,17 @@ class Model(nn.Module):
         # 创建MoE实例
         self.moe_3 = MoE(
             input_size=moe_3_config.get('input_size', 128),
-            head_size=moe_3_config.get('head_size', 512),
-            num_experts=moe_3_config.get('num_experts', 8),
-            k=moe_3_config.get('k', 2),
+            head_size=moe_3_config.get('head_size', 256),
+            hidden_sizes=moe_3_config.get('hidden_sizes', None),  # 支持多层FFN
+            num_experts=moe_3_config.get('num_experts', 3),
+            k=moe_3_config.get('k', 1),
             need_merge=moe_3_config.get('need_merge', True),
             cvloss=moe_3_config.get('cvloss', 0.05),
-            aux_loss=moe_3_config.get('aux_loss', 1),
+            aux_loss=moe_3_config.get('aux_loss', 0.01),
             zloss=moe_3_config.get('zloss', 0.001),
-            bias=moe_3_config.get('bias', False),
+            bias=moe_3_config.get('bias', True),
             activation=nn.GELU(),
-            noisy_gating=moe_3_config.get('noisy_gating', True)
+            noisy_gating=moe_3_config.get('noisy_gating', False)
         )
 
         # 归一化层
@@ -242,22 +245,24 @@ class Model(nn.Module):
         multi_attn_4_config = config.get('multi_attention_4', {})
 
         # 实例化MultiheadAttention4（自注意力）
+        embed_dim_4 = multi_attn_4_config.get('embed_dim', 128)
+        num_heads_4 = multi_attn_4_config.get('num_heads', 1)
         self.multi_attention_4 = MultiheadAttention(
-            embed_dim=multi_attn_4_config.get('embed_dim', 128),
-            num_heads=multi_attn_4_config.get('num_heads', 2),  # 可以适当增加头数
+            embed_dim=embed_dim_4,
+            num_heads=num_heads_4,
             dropout=multi_attn_4_config.get('dropout', 0.1),
             bias=multi_attn_4_config.get('bias', True),
             q_noise=multi_attn_4_config.get('q_noise', 0.005),
             qn_block_size=multi_attn_4_config.get('qn_block_size', 8),
-            num_expert=multi_attn_4_config.get('num_expert', 8),
-            head_dim=multi_attn_4_config.get('head_dim', 64),
+            num_expert=multi_attn_4_config.get('num_expert', 3),
+            head_dim=embed_dim_4 // num_heads_4,  # 自动计算head_dim
             use_attention_gate=multi_attn_4_config.get('use_attention_gate', False),
             cvloss=multi_attn_4_config.get('cvloss', 0.05),
-            aux_loss=multi_attn_4_config.get('aux_loss', 1),
+            aux_loss=multi_attn_4_config.get('aux_loss', 0.01),
             zloss=multi_attn_4_config.get('zloss', 0.001),
-            sample_topk=multi_attn_4_config.get('sample_topk', 0),
-            noisy_gating=multi_attn_4_config.get('noisy_gating', True),
-            use_pos_bias=multi_attn_4_config.get('use_pos_bias', False)  # 自注意力中可以不使用位置偏置
+            sample_topk=multi_attn_4_config.get('sample_topk', 1),
+            noisy_gating=multi_attn_4_config.get('noisy_gating', False),
+            use_pos_bias=multi_attn_4_config.get('use_pos_bias', False)
         )
 
         # LayerNorm for attention2 residual
@@ -266,40 +271,40 @@ class Model(nn.Module):
         # 获取ISP解码器配置
         isp_1_config = config.get('isp_1', {})
         isp_2_config = config.get('isp_2', {})
-        isp_3_config = config.get('isp_3', {})
         isp_4_config = config.get('isp_4', {})
 
-        # 实例化四个ISP解码器
+        # 实例化三个ISP解码器（移除isp_3，去噪锐化使用固定参数）
         self.isp_1 = ISPDecoder(
             latent_dim=isp_1_config.get('latent_dim', 128),
             param_dim=isp_1_config.get('param_dim', 1),
-            hidden_dims=isp_1_config.get('hidden_dims', [256, 128, 64, 32])
+            hidden_dims=isp_1_config.get('hidden_dims', [256, 128, 64, 32]),
+            dropout=isp_1_config.get('dropout', 0.1),
+            use_identity_init=True  # 保持接近0的初始化
         )
 
         self.isp_2 = ISPDecoder(
             latent_dim=isp_2_config.get('latent_dim', 128),
-            param_dim=isp_2_config.get('param_dim', 3),
-            hidden_dims=isp_2_config.get('hidden_dims', [256, 128, 64, 32])
-        )
-
-        self.isp_3 = ISPDecoder(
-            latent_dim=isp_3_config.get('latent_dim', 128),
-            param_dim=isp_3_config.get('param_dim', 9),
-            hidden_dims=isp_3_config.get('hidden_dims', [256, 128, 64, 32])
+            param_dim=isp_2_config.get('param_dim', 576),
+            hidden_dims=isp_2_config.get('hidden_dims', [256, 384, 512, 576]),
+            dropout=isp_2_config.get('dropout', 0.1),
+            use_identity_init=True  # 保持接近0的初始化
         )
 
         self.isp_4 = ISPDecoder(
             latent_dim=isp_4_config.get('latent_dim', 128),
-            param_dim=isp_4_config.get('param_dim', 7),
-            hidden_dims=isp_4_config.get('hidden_dims', [256, 128, 64, 32])
+            param_dim=isp_4_config.get('param_dim', 1),
+            hidden_dims=isp_4_config.get('hidden_dims', [256, 128, 64, 32]),
+            dropout=isp_4_config.get('dropout', 0.1),
+            use_identity_init=False,  # 使用随机初始化
+            bias_init=1.0  # 饱和度参数初始化为1.0，让网络默认预测更强的增强
         )
 
-        # 添加一个新的解码器用于最终去噪
-        self.isp_final = ISPDecoder(
-            latent_dim=128,  # 与其他解码器相同
-            param_dim=7,  # 与第一次去噪相同的参数维度
-            hidden_dims=[256, 128, 64, 32]
-        )
+        vgg_model = vgg16(pretrained=True).features[:16]
+        for param in vgg_model.parameters():
+            param.requires_grad = False
+
+        self.perceptual_loss = PerceptualLoss(vgg_model)
+        self.perceptual_loss.eval()
 
         # 在初始化过程中配置CUDA优化
         if torch.cuda.is_available():
@@ -310,6 +315,29 @@ class Model(nn.Module):
 
         # 初始化去噪锐化器以避免重复创建
         self.denoising_sharpening = DenoisingSharpening()
+        self.color_transform = ColorTransform(
+            residual_scale=0.5,    # 增大残差连接的缩放因子
+            use_residual=True      # 使用残差连接
+        )
+        
+        # 添加单隐藏层MLP用于处理isp_final_2
+        self.isp_final_2_mlp = nn.Sequential(
+            nn.Linear(9, 9),
+            nn.GELU(),
+            nn.Linear(9, 9)
+        )
+        
+        # 添加可学习的残差连接权重
+        self.isp_final_2_residual_weight = nn.Parameter(torch.tensor(0.5))
+        
+        # 使用与ISP解码器相同的初始化方法
+        with torch.no_grad():
+            # 第一层
+            nn.init.xavier_uniform_(self.isp_final_2_mlp[0].weight, gain=0.3)
+            nn.init.zeros_(self.isp_final_2_mlp[0].bias)
+            # 输出层
+            nn.init.xavier_uniform_(self.isp_final_2_mlp[2].weight, gain=0.3)
+            nn.init.zeros_(self.isp_final_2_mlp[2].bias)
 
     def forward(self, x, target=None):
         """
@@ -318,10 +346,11 @@ class Model(nn.Module):
         Args:
             x: 输入的低光照图像
             target: 目标正常光照图像。训练模式下必须提供，否则无法计算损失
+            compute_loss: 是否计算损失。如果为None，则根据self.training判断
 
         Returns:
-            如果训练模式: (enhanced_image, loss, reconstruction_loss) - 增强后的图像和计算的损失
-            如果测试模式: enhanced_image - 仅返回增强后的图像
+            如果compute_loss为True: (enhanced_image, loss) - 增强后的图像和计算的损失
+            如果compute_loss为False: enhanced_image - 仅返回增强后的图像
         """
         # 使用混合精度计算
         with amp.autocast(enabled=torch.cuda.is_available()):
@@ -334,56 +363,11 @@ class Model(nn.Module):
             # 确保输入张量连续
             x = x.contiguous()
 
-            # 判断是否使用重叠窗口
-            use_overlap = self.window_overlap and not self.training  # 训练时不使用重叠
-
-            # 训练时的随机偏移
-            if self.training and self.train_random_shift and self.window_processor is not None:
-                # 对输入图像应用随机偏移
-                x_shifted = self.window_processor.apply_random_shift(x, self.max_shift)
-            else:
-                x_shifted = x
-
             # 特征提取
-            if use_overlap:
-                # 计算重叠步长
-                overlap_stride = int(self.win_size * (1 - self.overlap_ratio))
-                features, h_windows, w_windows, window_coords = self.feature_extractor(
-                    x_shifted, overlap_stride=overlap_stride, return_coords=True
-                )
-            else:
-                features, h_windows, w_windows = self.feature_extractor(x_shifted)
-                window_coords = None
+            features, h_windows, w_windows = self.feature_extractor(x)
 
             window_size = self.patch_size * self.win_size  # 计算窗口大小
 
-            # 如果使用重叠窗口，需要处理输入图像的窗口化
-            if use_overlap:
-                # 计算原始patch数
-                _, _, h_patches, w_patches = self.feature_extractor.patch_embed(
-                    self.feature_extractor.enhance(
-                        self.feature_extractor.local_feature(x_shifted)
-                    )
-                ).shape
-
-                # 使用unfold创建重叠窗口
-                x_padded = x_shifted
-                x_unfold = x_padded.unfold(2, window_size, overlap_stride * self.patch_size)
-                x_unfold = x_unfold.unfold(3, window_size, overlap_stride * self.patch_size)
-
-                # 重新排列为窗口格式
-                x_win = x_unfold.permute(0, 2, 3, 1, 4, 5).contiguous()
-                x_win = x_win.reshape(batch_size * h_windows * w_windows, channels, window_size, window_size)
-                x_win = x_win.permute(0, 2, 3, 1).contiguous()
-                x_win = x_win.reshape(batch_size, h_windows * w_windows, window_size, window_size, channels)
-            else:
-                # 原始的非重叠窗口处理
-                # 重塑输入图像为[batch_size, channels, h_windows, window_size, w_windows, window_size]格式
-                x_reshaped = x_shifted.reshape(batch_size, channels, h_windows, window_size, w_windows, window_size)
-                # 调整维度顺序为[batch_size, h_windows, w_windows, window_size, window_size, channels]
-                x_reordered = x_reshaped.permute(0, 2, 4, 3, 5, 1).contiguous()
-                # 重塑为[batch_size, h_windows * w_windows, window_size, window_size, channels]
-                x_win = x_reordered.reshape(batch_size, h_windows * w_windows, window_size, window_size, channels)
 
             # EispGeneratorFFN处理
             e_isp = self.emb_gen(features)
@@ -487,7 +471,7 @@ class Model(nn.Module):
             )
 
             # 残差连接和归一化
-            attn_output_4 = self.attn4_norm(attn_output_4) + moe_output_3
+            attn_output_4 = self.attn4_norm(attn_output_4) + moe_output_3 + 1e-6
 
             # 1. 合并前两个维度
             bsz, patches, k, head_dim = attn_output_4.shape
@@ -496,108 +480,63 @@ class Model(nn.Module):
             # 2. 将原始的第三个维度（tgt_len）放到第一个位置
             attn_output_4 = attn_output_4.transpose(0, 1)  # [tgt_len, bsz*patches, head_dim]
 
-            # 直接从转置后的张量中获取四个专家嵌入
+            # 从转置后的张量中获取三个专家嵌入（移除isp_expert_3）
             isp_expert_1 = attn_output_4[0]
             isp_expert_2 = attn_output_4[1]
-            isp_expert_3 = attn_output_4[2]
-            isp_expert_4 = attn_output_4[3]
+            isp_expert_4 = attn_output_4[2]  # 跳过index 2，直接使用index 3作为饱和度专家
 
-            # 分别输入到四个解码器中
-            isp_final_1 = self.isp_1(isp_expert_1)  # [num_windows, param_dim_1]
-            isp_final_2 = self.isp_2(isp_expert_2)
-            isp_final_3 = self.isp_3(isp_expert_3)
-            isp_final_4 = self.isp_4(isp_expert_4)
-            isp_final_5 = self.isp_final(isp_expert_4)
+            # 分别输入到三个解码器中
+            isp_final_1 = self.isp_1(isp_expert_1)  # [num_windows, param_dim_1 = 1] gamma参数
+            isp_final_2 = self.isp_2(isp_expert_2)  # [num_windows, param_dim_2 = 9] 联合校正参数
+            isp_final_4 = self.isp_4(isp_expert_4)  # [num_windows, param_dim_4 = 1] 饱和度参数
 
             # 获取配置中的param_dim参数
-            param_dim_1 = self.isp_1.param_dim  # 通过解码器输出层获取param_dim
+            param_dim_1 = self.isp_1.param_dim
             param_dim_2 = self.isp_2.param_dim
-            param_dim_3 = self.isp_3.param_dim
             param_dim_4 = self.isp_4.param_dim
 
             isp_final_1 = isp_final_1.reshape(-1, h_windows * w_windows, param_dim_1)
-            isp_final_2 = isp_final_2.reshape(-1, h_windows * w_windows, param_dim_2)
-            isp_final_3 = isp_final_3.reshape(-1, h_windows * w_windows, 3, 3)
+
+            # 像素级变换矩阵参数重塑
+            window_size = self.patch_size * self.win_size  # 8
+            isp_final_2 = isp_final_2.reshape(batch_size, h_windows * w_windows, 576)
+            isp_final_2 = isp_final_2.reshape(batch_size, h_windows, w_windows, 64, 9)
+            isp_final_2 = isp_final_2.reshape(batch_size, h_windows, w_windows, 8, 8, 9)
+            isp_final_2 = isp_final_2.permute(0, 1, 3, 2, 4, 5)
+            isp_final_2 = isp_final_2.reshape(batch_size, h_windows * 8, w_windows * 8, 9)
+            
+            # 通过MLP处理isp_final_2，并加上可学习的残差连接
+            isp_final_2_original = isp_final_2
+            isp_final_2_processed = self.isp_final_2_mlp(isp_final_2)
+            isp_final_2 = isp_final_2_original + self.isp_final_2_residual_weight * isp_final_2_processed
+
             isp_final_4 = isp_final_4.reshape(-1, h_windows * w_windows, param_dim_4)
-            isp_final_5 = isp_final_5.reshape(-1, h_windows * w_windows, param_dim_4)
 
-            # 如果使用重叠窗口，需要合并ISP参数
-            if use_overlap:
-                # 计算原始的patch数
-                h_patches_total = height // (self.patch_size * self.patch_size)
-                w_patches_total = width // (self.patch_size * self.patch_size)
+            # 将原始图像从[batch_size, 3, H, W]转换为[batch_size, H, W, 3]
+            enhanced_image = x.permute(0, 2, 3, 1)  # [batch_size, H, W, 3]
 
-                # 合并重叠的ISP参数
-                isp_params_list = [isp_final_1, isp_final_2, isp_final_3, isp_final_4, isp_final_5]
-                merged_params = merge_overlapping_params(
-                    isp_params_list, window_coords, h_windows, w_windows,
-                    self.win_size, overlap_stride, h_patches_total, w_patches_total,
-                    self.blend_mode
-                )
+            # 将sRGB空间转换到线性空间 (L^2.2)
+            #enhanced_image_final = torch.pow(enhanced_image, 2.2)
 
-                isp_final_1, isp_final_2, isp_final_3, isp_final_4, isp_final_5 = merged_params
+            # 按顺序应用3个增强方法
 
-                # 重新整形为窗口格式用于ISP处理
-                # 这里需要将合并后的参数重新分配到原始的非重叠窗口
-                # 为了简化，我们直接在像素级别应用ISP
-                enhanced_image = x_shifted  # 使用原始图像作为基础
+            # 1. 联合变换矩阵
+            enhanced_image_final = self.color_transform(I_source=enhanced_image,
+                                                               pred_transform_params=isp_final_2)
 
-                # 将参数重塑为适合整个图像的格式
-                isp_1_full = isp_final_1.reshape(batch_size, h_patches_total, w_patches_total, param_dim_1)
-                isp_2_full = isp_final_2.reshape(batch_size, h_patches_total, w_patches_total, param_dim_2)
-                isp_3_full = isp_final_3.reshape(batch_size, h_patches_total, w_patches_total, 3, 3)
-                isp_4_full = isp_final_4.reshape(batch_size, h_patches_total, w_patches_total, param_dim_4)
-                isp_5_full = isp_final_5.reshape(batch_size, h_patches_total, w_patches_total, param_dim_4)
+            # 3.应用最终去噪和锐化（使用固定参数）
+            enhanced_image_final = self.denoising_sharpening(images=enhanced_image_final)
 
-                # 为每个patch应用ISP（这里需要修改ISP函数以支持逐patch处理）
-                # 临时解决方案：将整个图像作为一个大窗口处理
-                enhanced_image = enhanced_image.permute(0, 2, 3, 1).unsqueeze(1)  # [B, 1, H, W, C]
+            # 4. gamma增强
+            global_gamma = isp_final_1.mean(dim=1, keepdim=True)  # [B, 1, 1]
+            enhanced_image_final = gamma_correct(L=enhanced_image_final, gamma_increment=global_gamma)
 
-                # 使用平均参数
-                isp_1_avg = isp_1_full.mean(dim=[1, 2], keepdim=True)
-                isp_2_avg = isp_2_full.mean(dim=[1, 2], keepdim=True)
-                isp_3_avg = isp_3_full.mean(dim=[1, 2], keepdim=True)
-                isp_4_avg = isp_4_full.mean(dim=[1, 2], keepdim=True)
-                isp_5_avg = isp_5_full.mean(dim=[1, 2], keepdim=True)
+            # 从线性空间转换回sRGB空间 (L^(1/2.2))
+            #enhanced_image_final = torch.pow(enhanced_image_final, 1.0 / 2.2)
 
-                # 应用ISP增强
-                enhanced_image_1 = self.denoising_sharpening(images=enhanced_image, params=isp_4_avg)
-                enhanced_image_2 = patch_gamma_correct(L=enhanced_image_1, gamma_increment=isp_1_avg)
-                enhanced_image_3 = white_balance(predicted_gains=isp_2_avg, I_source=enhanced_image_2)
-                enhanced_image_4 = apply_color_correction_matrices(I_source=enhanced_image_3, pred_matrices=isp_3_avg)
-                enhanced_image_final = self.denoising_sharpening(images=enhanced_image_4, params=isp_5_avg)
-
-                # 恢复为标准图像格式
-                enhanced_image_final = enhanced_image_final.squeeze(1).permute(0, 3, 1, 2).contiguous()
-
-            else:
-                # 原始的非重叠处理
-                enhanced_image = x_win
-
-                # 按顺序应用四个增强方法
-                # 4. 去噪与锐化
-                enhanced_image_1 = self.denoising_sharpening(images=enhanced_image, params=isp_final_4)
-
-                # 1. LIME增强
-                enhanced_image_2 = patch_gamma_correct(L=enhanced_image_1, gamma_increment=isp_final_1)
-
-                # 2. 白平衡
-                enhanced_image_3 = white_balance(predicted_gains=isp_final_2, I_source=enhanced_image_2)
-
-                # 3. 色彩校正矩阵
-                enhanced_image_4 = apply_color_correction_matrices(I_source=enhanced_image_3, pred_matrices=isp_final_3)
-
-                # 应用最终去噪和锐化
-                enhanced_image_final = self.denoising_sharpening(images=enhanced_image_4, params=isp_final_5)
-
-                # 将增强后的窗口图像重构回原始图像形状
-                enhanced_image_final = enhanced_image_final.permute(0, 1, 4, 2, 3).contiguous()  # [B, P, C, H, W]
-                enhanced_image_final = enhanced_image_final.reshape(
-                    batch_size, h_windows, w_windows, channels, window_size, window_size
-                )
-                enhanced_image_final = enhanced_image_final.permute(0, 3, 1, 4, 2, 5).contiguous()
-                enhanced_image_final = enhanced_image_final.reshape(batch_size, channels,
-                                                                    h_windows * window_size, w_windows * window_size)
+            # 对所有windows取平均，得到每个图的全局饱和度参数
+            global_saturation = isp_final_4.mean(dim=1)  # [B, 1]
+            enhanced_image_final = contrast_enhancement(image = enhanced_image_final, alpha = global_saturation)
 
             # 训练模式下才计算损失并返回
             if self.training:
@@ -605,14 +544,84 @@ class Model(nn.Module):
                 auxiliary_loss = (atten_aux_loss_1 + moe_aux_loss_1 + atten_aux_loss_2 + \
                                   moe_aux_loss_2 + atten_aux_loss_3 + moe_aux_loss_3 + atten_aux_loss_4) / 7
 
-                # 使用目标图像计算重建损失
-                l1_loss = L1ReconstructionLoss()
+                # 使用目标图像计算重建损失 (使用Charbonnier损失提升鲁棒性)
+                charbonnier_loss = CharbonnierLoss(epsilon=1e-3)
+                reconstruction_loss = charbonnier_loss(enhanced_image_final, target)
 
-                reconstruction_loss = l1_loss(enhanced_image_final, target)
+                # 感知损失
+                perceptual = self.perceptual_loss(enhanced_image_final, target)
 
-                # 使用权重系数组合不同的损失
-                loss = (self.reconstruction_weight * reconstruction_loss +
-                        self.auxiliary_weight * auxiliary_loss)
+                # LAB色彩损失 - 增加预防性检查
+                def safe_lab_loss(pred, target):
+                    """安全的LAB损失计算，避免CUDA索引越界"""
+                    try:
+                        # 预检查：确保输入有效
+                        if pred.numel() == 0 or target.numel() == 0:
+                            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+                        
+                        if pred.shape != target.shape:
+                            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+                            
+                        # 确保数值在安全范围内
+                        pred_safe = torch.clamp(pred, 0.0, 1.0)
+                        target_safe = torch.clamp(target, 0.0, 1.0)
+                        
+                        # 检查是否包含NaN或Inf
+                        if torch.isnan(pred_safe).any() or torch.isinf(pred_safe).any():
+                            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+                        if torch.isnan(target_safe).any() or torch.isinf(target_safe).any():
+                            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+                        
+                        # 尝试LAB损失计算
+                        lab_color_loss = LABColorLoss(color_weight=1.0)
+                        return lab_color_loss(pred_safe, target_safe)
+                        
+                    except Exception as e:
+                        # 如果仍然失败，返回简单的L1损失
+                        return F.l1_loss(pred, target, reduction='mean') * 0.01
+                
+                color_loss = safe_lab_loss(enhanced_image_final, target)
+
+
+                # 计算PSNR损失 (添加数值稳定性检查)
+                psnr_value = kornia.metrics.psnr(enhanced_image_final, target, max_val=1.0)
+                # 限制PSNR值范围，避免极端情况
+                psnr_value = torch.clamp(psnr_value, min=0.0, max=50.0)
+                # 使用更稳定的损失计算方式
+                psnr_loss = torch.max(torch.tensor(0.0, device=psnr_value.device),
+                                      (50.0 - psnr_value) / 50.0)
+
+                # 计算SSIM损失 (添加数值稳定性检查)
+                ssim_value = kornia.metrics.ssim(enhanced_image_final, target, window_size=11, max_val=1.0)
+                ssim_value = torch.clamp(ssim_value, min=0.0, max=1.0)  # 限制SSIM值范围
+                ssim_loss = 1.0 - ssim_value.mean()  # SSIM越大损失越小
+
+                # 检查损失是否为nan或inf
+                if torch.isnan(psnr_loss) or torch.isinf(psnr_loss):
+                    psnr_loss = torch.tensor(0.0, device=psnr_loss.device)
+                if torch.isnan(ssim_loss) or torch.isinf(ssim_loss):
+                    ssim_loss = torch.tensor(0.0, device=ssim_loss.device)
+
+                # 计算每种损失的加权值
+                weighted_reconstruction = self.reconstruction_weight * reconstruction_loss
+                weighted_perceptual = self.perceptual_weight * perceptual
+                weighted_auxiliary = self.auxiliary_weight * auxiliary_loss
+                weighted_psnr = self.psnr_weight * psnr_loss
+                weighted_ssim = self.ssim_weight * ssim_loss
+                weighted_color = self.lab_color_weight * color_loss
+                
+                # 使用权重系数组合不同的损失 (L1+感知+辅助+PSNR+SSIM+LAB色彩+饱和度匹配)
+                loss = (weighted_reconstruction + weighted_perceptual + weighted_auxiliary +
+                        weighted_psnr + weighted_ssim + weighted_color)
+                
+                # 打印每种损失的加权值
+                print(f"Loss Details - Reconstruction: {weighted_reconstruction.item():.6f}, "
+                      f"Perceptual: {weighted_perceptual.item():.6f}, "
+                      f"Auxiliary: {weighted_auxiliary.item():.6f}, "
+                      f"PSNR: {weighted_psnr.item():.6f}, "
+                      f"SSIM: {weighted_ssim.item():.6f}, "
+                      f"Color: {weighted_color.item():.6f}, "
+                      f"Total: {loss.item():.6f}")
 
                 return enhanced_image_final, loss, reconstruction_loss
             else:

@@ -1,7 +1,0 @@
-Looking in indexes: http://mirrors.aliyun.com/pypi/simple
-Collecting cython
-  Using cached http://mirrors.aliyun.com/pypi/packages/43/ca/57723154d0a28bd75419f58479629a08b3a2dd5ed5dd21259a7c4c1e4d9f/cython-3.1.0-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (3.3 MB)
-Requirement already satisfied: numpy in /root/miniconda3/envs/moe/lib/python3.10/site-packages (1.26.0)
-Requirement already satisfied: setuptools in /root/miniconda3/envs/moe/lib/python3.10/site-packages (78.1.1)
-Installing collected packages: cython
-Successfully installed cython-3.1.0
