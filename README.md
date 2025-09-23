@@ -267,7 +267,7 @@ masenet/
 ```bibtex
 @misc{masenet2024,
   title={MaSE-Net: Mixture attention \& Selective Enhancement Network for Low-light Image Enhancement},
-  author={Your Name},
+  author={Xutong Lin},
   year={2025},
   howpublished={\url{https://github.com/Britark/MASE-Net}}
 }
